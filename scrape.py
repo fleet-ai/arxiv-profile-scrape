@@ -2,13 +2,14 @@
 """
 US researcher scraper for RL, post-training, world models, and environment simulation.
 
-Uses OpenAlex API to find US-affiliated researchers publishing in these areas,
-with structured institution/country/city data. Outputs a single CSV for hiring.
+Uses OpenAlex API to find US-based industry/lab researchers publishing in these areas.
+Filters out tenured academia (keeps companies, national labs, research institutes).
 """
 
 import argparse
 import csv
 import logging
+import re
 import time
 import urllib.parse
 from datetime import datetime, timedelta, timezone
@@ -38,24 +39,43 @@ OPENALEX_QUERIES = [
 OPENALEX_API = "https://api.openalex.org"
 OPENALEX_EMAIL = "scraper@fleet.ai"
 
-# Paper title must contain at least one of these to be included (case-insensitive).
-# Filters out off-topic results from OpenAlex's fuzzy text search.
-RELEVANCE_KEYWORDS = [
-    "reinforcement learning", "rl ", " rl,", "reward model", "reward shaping",
-    "rlhf", "grpo", "dpo", "ppo", "policy optimization", "policy gradient",
-    "preference optimization", "preference learning", "preference alignment",
-    "post-training", "alignment", "fine-tuning", "finetuning",
-    "world model", "model-based rl", "model based rl",
-    "sim-to-real", "sim2real", "environment simulation",
-    "large language model", "llm", "language model",
-    "deep learning", "neural network", "transformer",
-    "machine learning", "multi-agent", "multi agent",
-    "robot learning", "robot control", "locomotion",
-    "imitation learning", "inverse reinforcement",
-    "offline reinforcement", "online reinforcement",
-    "actor-critic", "q-learning", "value function",
-    "curriculum learning", "exploration",
+# Title must match at least one of these patterns (case-insensitive).
+# Tight filter: only RL, post-training, world models, env sim — no generic ML.
+RELEVANCE_PATTERNS = [
+    r"reinforcement learn",
+    r"\brl\b",
+    r"\brlhf\b",
+    r"\bgrpo\b",
+    r"\bdpo\b",
+    r"\bppo\b",
+    r"reward model",
+    r"reward shap",
+    r"policy optimiz",
+    r"policy gradient",
+    r"preference optimiz",
+    r"preference learn",
+    r"preference align",
+    r"post.training",
+    r"world model",
+    r"model.based reinforcement",
+    r"sim.to.real",
+    r"sim2real",
+    r"imitation learn",
+    r"inverse reinforcement",
+    r"offline reinforcement",
+    r"online reinforcement",
+    r"actor.critic",
+    r"q.learning",
+    r"multi.agent reinforcement",
+    r"robot.?learn",
 ]
+
+# Compile for speed
+_RELEVANCE_RE = [re.compile(p, re.IGNORECASE) for p in RELEVANCE_PATTERNS]
+
+# Institution types to KEEP. Excludes "education" (universities/tenured professors).
+# Post-docs at companies/labs are included since their institution is the company/lab.
+ALLOWED_INSTITUTION_TYPES = {"company", "facility", "government", "nonprofit", "other", ""}
 
 FIELDNAMES = [
     "name",
@@ -75,7 +95,7 @@ FIELDNAMES = [
 # ---------------------------------------------------------------------------
 
 def openalex_search(query: str, start_date: str, end_date: str) -> list[dict]:
-    """Search OpenAlex for US-affiliated works matching query. Paginates through all results."""
+    """Search OpenAlex for US-affiliated works matching query."""
     all_results = []
     cursor = "*"
     filter_str = f"from_publication_date:{start_date},to_publication_date:{end_date},institutions.country_code:US"
@@ -116,13 +136,12 @@ def openalex_search(query: str, start_date: str, end_date: str) -> list[dict]:
 
 
 def is_relevant(title: str) -> bool:
-    """Check if a paper title contains at least one ML/RL keyword."""
-    title_lower = title.lower()
-    return any(kw in title_lower for kw in RELEVANCE_KEYWORDS)
+    """Check if a paper title matches at least one RL/post-training pattern."""
+    return any(r.search(title) for r in _RELEVANCE_RE)
 
 
 def extract_us_authors(works: list[dict], seen: set[str]) -> list[dict]:
-    """Extract US-affiliated author rows from relevant OpenAlex works."""
+    """Extract US industry/lab author rows from relevant OpenAlex works."""
     rows = []
     for work in works:
         title = (work.get("title") or "").replace("\n", " ").strip()
@@ -139,11 +158,7 @@ def extract_us_authors(works: list[dict], seen: set[str]) -> list[dict]:
             if not name:
                 continue
 
-            key = (name, title)
-            if key in seen:
-                continue
-            seen.add(key)
-
+            # Find the US institution
             institution = ""
             institution_type = ""
             city = ""
@@ -152,6 +167,15 @@ def extract_us_authors(works: list[dict], seen: set[str]) -> list[dict]:
                     institution = inst.get("display_name", "")
                     institution_type = inst.get("type", "")
                     break
+
+            # Filter: only keep non-education institution types
+            if institution_type not in ALLOWED_INSTITUTION_TYPES:
+                continue
+
+            key = (name, title)
+            if key in seen:
+                continue
+            seen.add(key)
 
             raw_strings = auth.get("raw_affiliation_strings", [])
             if raw_strings:
@@ -227,7 +251,7 @@ def scrape(start_date: datetime, end_date: datetime):
         works = openalex_search(query, start_str, end_str)
         rows = extract_us_authors(works, seen)
         new_rows.extend(rows)
-        log.info(f"  {len(works)} works -> {len(rows)} new US entries")
+        log.info(f"  {len(works)} works -> {len(rows)} new entries")
 
     all_rows = existing_rows + new_rows
     save_data(all_rows)
@@ -237,7 +261,7 @@ def scrape(start_date: datetime, end_date: datetime):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Scrape OpenAlex for US-based ML researchers")
+    parser = argparse.ArgumentParser(description="Scrape OpenAlex for US-based industry ML researchers")
     parser.add_argument("--days", type=int, default=2, help="Number of days to look back (default: 2 for nightly)")
     parser.add_argument("--backfill-months", type=int, default=0, help="Backfill N months of data")
     args = parser.parse_args()
